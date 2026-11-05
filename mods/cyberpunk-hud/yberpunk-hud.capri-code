@@ -1,0 +1,611 @@
+// capri-mod: 1
+// id: cyberpunk-hud
+// name: Cyberpunk HUD
+// version: 0.1.0
+// author: distruttore3421
+// description: A futuristic holographic system HUD for Capri.
+
+using System;
+using System.Diagnostics;
+using System.Drawing;
+using System.Drawing.Drawing2D;
+using System.Drawing.Text;
+using System.Runtime.InteropServices;
+using System.Threading;
+using System.Windows.Forms;
+using CapriDesktop;
+
+public class CyberpunkHud : ICapriMod
+{
+    private ICapriHost capri;
+    private HudManager manager;
+
+    // Se impostato su true, l'HUD compare automaticamente appena la mod viene avviata.
+    // Se impostato su false, rimane nascosto finché non dici "hud test".
+    private bool showOnStartup = true;
+
+    public void Start(ICapriHost host)
+    {
+        capri = host;
+        manager = new HudManager(host, showOnStartup);
+        manager.Start();
+        capri.Log("Cyberpunk HUD initialized.");
+    }
+
+    // =========================================================================
+    // GESTIONE DEI COMANDI VOCALI (CAPRI VOICE COMMANDS)
+    // =========================================================================
+    public bool Heard(string words)
+    {
+        if (string.IsNullOrEmpty(words))
+            return false;
+
+        // ---------------------------------------------------------------------
+        // COMANDO: RIMOZIONE / CHIUSURA DELL'HUD
+        // Se pronunci "remove hud test" (oppure "remove hud", "close hud", "chiudi hud")
+        // l'HUD si toglie / si nasconde dallo schermo.
+        // ---------------------------------------------------------------------
+        if (words.IndexOf("remove hud test", StringComparison.OrdinalIgnoreCase) >= 0 ||
+            words.IndexOf("remove hud", StringComparison.OrdinalIgnoreCase) >= 0 ||
+            words.IndexOf("close hud", StringComparison.OrdinalIgnoreCase) >= 0 ||
+            words.IndexOf("hide hud", StringComparison.OrdinalIgnoreCase) >= 0 ||
+            words.IndexOf("chiudi hud", StringComparison.OrdinalIgnoreCase) >= 0 ||
+            words.IndexOf("nascondi hud", StringComparison.OrdinalIgnoreCase) >= 0)
+        {
+            if (manager != null)
+                manager.HideHud();
+
+            capri.Say("Cyberpunk HUD deactivated.");
+            capri.Log("Cyberpunk HUD closed via voice command.");
+            return true;
+        }
+
+        // ---------------------------------------------------------------------
+        // COMANDO: APERTURA / ATTIVAZIONE DELL'HUD
+        // Se pronunci "hud test" (oppure "open hud", "show hud", "apri hud", "mostra hud")
+        // l'HUD compare a schermo con le metriche in tempo reale.
+        // ---------------------------------------------------------------------
+        if (words.IndexOf("hud test", StringComparison.OrdinalIgnoreCase) >= 0 ||
+            words.IndexOf("open hud", StringComparison.OrdinalIgnoreCase) >= 0 ||
+            words.IndexOf("show hud", StringComparison.OrdinalIgnoreCase) >= 0 ||
+            words.IndexOf("apri hud", StringComparison.OrdinalIgnoreCase) >= 0 ||
+            words.IndexOf("mostra hud", StringComparison.OrdinalIgnoreCase) >= 0)
+        {
+            if (manager != null)
+                manager.ShowHud();
+
+            capri.Say("Cyberpunk HUD system online.");
+            capri.Log("Cyberpunk HUD displayed via voice command.");
+            return true;
+        }
+
+        return false;
+    }
+
+    public void Stop()
+    {
+        if (manager != null)
+        {
+            manager.Stop();
+            manager = null;
+        }
+
+        if (capri != null)
+            capri.Log("Cyberpunk HUD stopped.");
+    }
+}
+
+public class HudManager
+{
+    private ICapriHost capri;
+    private Thread hudThread;
+    private HudForm form;
+    private bool initialShow;
+
+    public HudManager(ICapriHost host, bool showImmediately)
+    {
+        capri = host;
+        initialShow = showImmediately;
+    }
+
+    public void Start()
+    {
+        hudThread = new Thread(RunThread);
+        hudThread.SetApartmentState(ApartmentState.STA);
+        hudThread.IsBackground = true;
+        hudThread.Start();
+    }
+
+    private void RunThread()
+    {
+        form = new HudForm(initialShow);
+        Application.Run(form);
+    }
+
+    public void ShowHud()
+    {
+        if (form != null && form.IsHandleCreated)
+        {
+            form.BeginInvoke(new Action(() => form.OpenHud()));
+        }
+    }
+
+    public void HideHud()
+    {
+        if (form != null && form.IsHandleCreated)
+        {
+            form.BeginInvoke(new Action(() => form.CloseHud()));
+        }
+    }
+
+    public void Stop()
+    {
+        if (form != null && form.IsHandleCreated)
+        {
+            form.BeginInvoke(new Action(() => form.Shutdown()));
+        }
+    }
+}
+
+public class HudForm : Form
+{
+    private System.Windows.Forms.Timer updateTimer;
+    private PerformanceCounter cpuCounter;
+    private GpuMonitor gpuMonitor;
+
+    private float cpuLoad = 0f;
+    private string ramUsage = "-- / 32 GB";
+    private float gpuLoad = 0f;
+    private float gpuTemp = 0f;
+
+    private Rectangle closeBtnRect;
+    private bool isCloseHovered = false;
+
+    public HudForm(bool showInitially)
+    {
+        this.FormBorderStyle = FormBorderStyle.None;
+        this.StartPosition = FormStartPosition.Manual;
+        this.Size = new Size(860, 330);
+
+        // Posizione in alto a destra sullo schermo principale
+        Rectangle workingArea = Screen.PrimaryScreen.WorkingArea;
+        this.Location = new Point(workingArea.Right - this.Width - 40, workingArea.Top + 60);
+
+        this.TopMost = true;
+        this.ShowInTaskbar = false;
+        this.DoubleBuffered = true;
+        this.BackColor = Color.FromArgb(5, 7, 12);
+
+        closeBtnRect = new Rectangle(this.Width - 45, 16, 26, 26);
+
+        InitHardware();
+
+        updateTimer = new System.Windows.Forms.Timer();
+        updateTimer.Interval = 1000;
+        updateTimer.Tick += UpdateTimer_Tick;
+        updateTimer.Start();
+
+        UpdateMetrics();
+
+        if (!showInitially)
+        {
+            this.Opacity = 0;
+            this.Show();
+            this.Hide();
+            this.Opacity = 1;
+        }
+    }
+
+    private void InitHardware()
+    {
+        try
+        {
+            cpuCounter = new PerformanceCounter("Processor", "% Processor Time", "_Total");
+            cpuCounter.NextValue();
+        }
+        catch { cpuCounter = null; }
+
+        try
+        {
+            gpuMonitor = new GpuMonitor();
+            gpuMonitor.Init();
+        }
+        catch { gpuMonitor = null; }
+    }
+
+    private void UpdateMetrics()
+    {
+        // CPU Load
+        try
+        {
+            if (cpuCounter != null)
+                cpuLoad = cpuCounter.NextValue();
+        }
+        catch { cpuLoad = 0f; }
+
+        // RAM Usage
+        try
+        {
+            ramUsage = RamMonitor.GetRamString();
+        }
+        catch { ramUsage = "-- / 32 GB"; }
+
+        // GPU Load & Temperature
+        try
+        {
+            if (gpuMonitor != null)
+            {
+                float gl, gt;
+                gpuMonitor.GetStats(out gl, out gt);
+                gpuLoad = gl;
+                gpuTemp = gt;
+            }
+        }
+        catch
+        {
+            gpuLoad = 0f;
+            gpuTemp = 0f;
+        }
+
+        this.Invalidate();
+    }
+
+    private void UpdateTimer_Tick(object sender, EventArgs e)
+    {
+        UpdateMetrics();
+    }
+
+    public void OpenHud()
+    {
+        this.Visible = true;
+        this.WindowState = FormWindowState.Normal;
+        this.BringToFront();
+        UpdateMetrics();
+    }
+
+    public void CloseHud()
+    {
+        this.Visible = false;
+    }
+
+    public void Shutdown()
+    {
+        if (updateTimer != null)
+        {
+            updateTimer.Stop();
+            updateTimer.Dispose();
+        }
+        if (cpuCounter != null)
+        {
+            cpuCounter.Dispose();
+            cpuCounter = null;
+        }
+        if (gpuMonitor != null)
+        {
+            gpuMonitor.Shutdown();
+            gpuMonitor = null;
+        }
+        this.Close();
+    }
+
+    protected override void WndProc(ref Message m)
+    {
+        const int WM_NCHITTEST = 0x84;
+        const int HTCLIENT = 0x1;
+        const int HTCAPTION = 0x2;
+
+        base.WndProc(ref m);
+
+        // Permette il trascinamento fluido della finestra cliccando ovunque tranne il pulsante di chiusura
+        if (m.Msg == WM_NCHITTEST && (int)m.Result == HTCLIENT)
+        {
+            Point cursor = this.PointToClient(Cursor.Position);
+            if (!closeBtnRect.Contains(cursor))
+            {
+                m.Result = (IntPtr)HTCAPTION;
+            }
+        }
+    }
+
+    protected override void OnMouseMove(MouseEventArgs e)
+    {
+        base.OnMouseMove(e);
+        bool hovered = closeBtnRect.Contains(e.Location);
+        if (hovered != isCloseHovered)
+        {
+            isCloseHovered = hovered;
+            this.Invalidate(closeBtnRect);
+        }
+    }
+
+    protected override void OnMouseClick(MouseEventArgs e)
+    {
+        base.OnMouseClick(e);
+        if (e.Button == MouseButtons.Left && closeBtnRect.Contains(e.Location))
+        {
+            CloseHud();
+        }
+    }
+
+    protected override void OnPaint(PaintEventArgs e)
+    {
+        base.OnPaint(e);
+        Graphics g = e.Graphics;
+        g.SmoothingMode = SmoothingMode.AntiAlias;
+        g.TextRenderingHint = TextRenderingHint.ClearTypeGridFit;
+
+        int width = this.Width;
+        int height = this.Height;
+
+        // Bordo esterno Neon Ciano
+        using (Pen borderPen = new Pen(Color.FromArgb(0, 150, 220), 1.5f))
+        {
+            g.DrawRectangle(borderPen, 1, 1, width - 2, height - 2);
+        }
+
+        // Icona di stato HUD (onda / chip neon)
+        int iconX = 28, iconY = 22;
+        using (Pen iconPen = new Pen(Color.FromArgb(0, 229, 255), 2f))
+        {
+            g.DrawRectangle(iconPen, iconX, iconY, 20, 16);
+            Point[] pulse = new Point[] {
+                new Point(iconX + 3, iconY + 9),
+                new Point(iconX + 7, iconY + 4),
+                new Point(iconX + 11, iconY + 12),
+                new Point(iconX + 15, iconY + 7),
+                new Point(iconX + 17, iconY + 9)
+            };
+            g.DrawLines(iconPen, pulse);
+        }
+
+        // Titolo Cyberpunk HUD
+        using (Font titleFont = new Font("Segoe UI", 13.5f, FontStyle.Bold))
+        using (SolidBrush titleBrush = new SolidBrush(Color.White))
+        {
+            g.DrawString("CYBERPUNK HUD", titleFont, titleBrush, 56, 18);
+        }
+
+        // Badge SYSTEM ONLINE
+        int badgeW = 120, badgeH = 24, badgeX = width - 180, badgeY = 18;
+        using (GraphicsPath badgePath = GetRoundedPath(new Rectangle(badgeX, badgeY, badgeW, badgeH), 12))
+        using (SolidBrush badgeBg = new SolidBrush(Color.FromArgb(4, 34, 18)))
+        using (Pen badgeBorder = new Pen(Color.FromArgb(0, 230, 118), 1.2f))
+        using (Font badgeFont = new Font("Segoe UI", 8.5f, FontStyle.Bold))
+        using (SolidBrush badgeText = new SolidBrush(Color.FromArgb(0, 230, 118)))
+        {
+            g.FillPath(badgeBg, badgePath);
+            g.DrawPath(badgeBorder, badgePath);
+            StringFormat sf = new StringFormat { Alignment = StringAlignment.Center, LineAlignment = StringAlignment.Center };
+            g.DrawString("SYSTEM ONLINE", badgeFont, badgeText, new RectangleF(badgeX, badgeY, badgeW, badgeH), sf);
+        }
+
+        // Pulsante di chiusura ✕
+        using (Font closeFont = new Font("Segoe UI", 11f, FontStyle.Bold))
+        using (SolidBrush closeBrush = new SolidBrush(isCloseHovered ? Color.FromArgb(255, 60, 90) : Color.FromArgb(120, 140, 160)))
+        {
+            StringFormat sfClose = new StringFormat { Alignment = StringAlignment.Center, LineAlignment = StringAlignment.Center };
+            g.DrawString("✕", closeFont, closeBrush, closeBtnRect, sfClose);
+        }
+
+        // Linea divisoria superiore
+        using (Pen divPen = new Pen(Color.FromArgb(14, 55, 95), 1.2f))
+        {
+            g.DrawLine(divPen, 25, 58, width - 25, 58);
+        }
+
+        // Contenuto metriche (CPU, RAM, GPU)
+        using (Font labelFont = new Font("Segoe UI", 9.5f, FontStyle.Bold))
+        using (Font valFont = new Font("Segoe UI", 22f, FontStyle.Bold))
+        using (SolidBrush cyanBrush = new SolidBrush(Color.FromArgb(0, 229, 255)))
+        using (SolidBrush purpleBrush = new SolidBrush(Color.FromArgb(168, 85, 247)))
+        using (SolidBrush whiteBrush = new SolidBrush(Color.White))
+        {
+            int col1X = 28;
+            int barW = 380;
+
+            // --- COLONNA SINISTRA (CPU & RAM) ---
+            g.DrawString("CPU LOAD", labelFont, cyanBrush, col1X, 78);
+            string cpuText = cpuLoad >= 0 ? string.Format("{0:0}%", cpuLoad) : "--%";
+            g.DrawString(cpuText, valFont, cyanBrush, col1X, 98);
+            DrawBar(g, col1X, 148, barW, 8, cpuLoad, Color.FromArgb(12, 34, 48), Color.FromArgb(0, 229, 255));
+
+            g.DrawString("RAM USAGE", labelFont, cyanBrush, col1X, 172);
+            g.DrawString(ramUsage, valFont, whiteBrush, col1X, 192);
+
+            // --- COLONNA DESTRA (GPU LOAD & GPU TEMP) ---
+            int col2X = width - 28 - barW;
+
+            g.DrawString("GPU LOAD", labelFont, purpleBrush, col2X, 78);
+            string gpuText = gpuLoad >= 0 ? string.Format("{0:0}%", gpuLoad) : "--%";
+            g.DrawString(gpuText, valFont, purpleBrush, col2X, 98);
+            DrawBar(g, col2X, 148, barW, 8, gpuLoad, Color.FromArgb(36, 16, 50), Color.FromArgb(168, 85, 247));
+
+            g.DrawString("GPU TEMP", labelFont, purpleBrush, col2X, 172);
+            string tempText = gpuTemp >= 0 ? string.Format("{0:0} °C", gpuTemp) : "-- °C";
+            g.DrawString(tempText, valFont, whiteBrush, col2X, 192);
+        }
+
+        // Linea divisoria inferiore
+        using (Pen divPen = new Pen(Color.FromArgb(14, 55, 95), 1.2f))
+        {
+            g.DrawLine(divPen, 25, 260, width - 25, 260);
+        }
+
+        // Footer
+        using (Font footerFont = new Font("Segoe UI", 9.5f, FontStyle.Bold))
+        using (SolidBrush cyanBrush = new SolidBrush(Color.FromArgb(0, 229, 255)))
+        using (SolidBrush purpleBrush = new SolidBrush(Color.FromArgb(168, 85, 247)))
+        {
+            g.DrawString("CAPRI CONNECTION", footerFont, cyanBrush, 28, 282);
+            StringFormat sfRight = new StringFormat { Alignment = StringAlignment.Far };
+            g.DrawString("HUD ENGINE ACTIVE", footerFont, purpleBrush, new RectangleF(width - 328, 282, 300, 24), sfRight);
+        }
+    }
+
+    private static void DrawBar(Graphics g, int x, int y, int w, int h, float percent, Color track, Color fill)
+    {
+        using (GraphicsPath trackPath = GetRoundedPath(new Rectangle(x, y, w, h), h / 2))
+        using (SolidBrush trackBrush = new SolidBrush(track))
+        {
+            g.FillPath(trackBrush, trackPath);
+        }
+
+        if (percent > 0)
+        {
+            float clamped = Math.Max(0, Math.Min(100, percent));
+            int fillW = (int)((w * clamped) / 100f);
+            if (fillW > 3)
+            {
+                using (GraphicsPath fillPath = GetRoundedPath(new Rectangle(x, y, fillW, h), h / 2))
+                using (SolidBrush fillBrush = new SolidBrush(fill))
+                {
+                    g.FillPath(fillBrush, fillPath);
+                }
+            }
+        }
+    }
+
+    private static GraphicsPath GetRoundedPath(Rectangle rect, int radius)
+    {
+        GraphicsPath path = new GraphicsPath();
+        int d = radius * 2;
+        path.AddArc(rect.X, rect.Y, d, d, 180, 90);
+        path.AddArc(rect.Right - d, rect.Y, d, d, 270, 90);
+        path.AddArc(rect.Right - d, rect.Bottom - d, d, d, 0, 90);
+        path.AddArc(rect.X, rect.Bottom - d, d, d, 90, 90);
+        path.CloseFigure();
+        return path;
+    }
+}
+
+public class RamMonitor
+{
+    [StructLayout(LayoutKind.Sequential, CharSet = CharSet.Auto)]
+    public class MEMORYSTATUSEX
+    {
+        public uint dwLength;
+        public uint dwMemoryLoad;
+        public ulong ullTotalPhys;
+        public ulong ullAvailPhys;
+        public ulong ullTotalPageFile;
+        public ulong ullAvailPageFile;
+        public ulong ullTotalVirtual;
+        public ulong ullAvailVirtual;
+        public ulong ullAvailExtendedVirtual;
+        public MEMORYSTATUSEX()
+        {
+            this.dwLength = (uint)Marshal.SizeOf(typeof(MEMORYSTATUSEX));
+        }
+    }
+
+    [return: MarshalAs(UnmanagedType.Bool)]
+    [DllImport("kernel32.dll", CharSet = CharSet.Auto, SetLastError = true)]
+    public static extern bool GlobalMemoryStatusEx([In, Out] MEMORYSTATUSEX lpBuffer);
+
+    public static string GetRamString()
+    {
+        MEMORYSTATUSEX mem = new MEMORYSTATUSEX();
+        if (GlobalMemoryStatusEx(mem))
+        {
+            double total = mem.ullTotalPhys / (1024.0 * 1024.0 * 1024.0);
+            double used = (mem.ullTotalPhys - mem.ullAvailPhys) / (1024.0 * 1024.0 * 1024.0);
+            return string.Format("{0:0.0} / {1:0} GB", used, Math.Round(total));
+        }
+        return "-- / 32 GB";
+    }
+}
+
+public class GpuMonitor
+{
+    [DllImport("nvml.dll", EntryPoint = "nvmlInit_v2")]
+    private static extern int nvmlInit();
+
+    [DllImport("nvml.dll", EntryPoint = "nvmlShutdown")]
+    private static extern int nvmlShutdown();
+
+    [DllImport("nvml.dll", EntryPoint = "nvmlDeviceGetHandleByIndex_v2")]
+    private static extern int nvmlDeviceGetHandleByIndex(uint index, out IntPtr device);
+
+    [StructLayout(LayoutKind.Sequential)]
+    private struct nvmlUtilization_t
+    {
+        public uint gpu;
+        public uint memory;
+    }
+
+    [DllImport("nvml.dll", EntryPoint = "nvmlDeviceGetUtilizationRates")]
+    private static extern int nvmlDeviceGetUtilizationRates(IntPtr device, out nvmlUtilization_t utilization);
+
+    [DllImport("nvml.dll", EntryPoint = "nvmlDeviceGetTemperature")]
+    private static extern int nvmlDeviceGetTemperature(IntPtr device, int sensorType, out uint temp);
+
+    private bool initialized = false;
+    private IntPtr deviceHandle = IntPtr.Zero;
+
+    public void Init()
+    {
+        try
+        {
+            if (nvmlInit() == 0 && nvmlDeviceGetHandleByIndex(0, out deviceHandle) == 0)
+            {
+                initialized = true;
+            }
+        }
+        catch { initialized = false; }
+    }
+
+    public void GetStats(out float load, out float temp)
+    {
+        load = -1f;
+        temp = -1f;
+        if (initialized && deviceHandle != IntPtr.Zero)
+        {
+            try
+            {
+                nvmlUtilization_t util;
+                if (nvmlDeviceGetUtilizationRates(deviceHandle, out util) == 0)
+                    load = util.gpu;
+
+                uint t;
+                if (nvmlDeviceGetTemperature(deviceHandle, 0, out t) == 0)
+                    temp = t;
+
+                return;
+            }
+            catch {}
+        }
+
+        // Fallback tramite nvidia-smi se nvml non è agganciabile
+        try
+        {
+            ProcessStartInfo psi = new ProcessStartInfo("nvidia-smi", "--query-gpu=utilization.gpu,temperature.gpu --format=csv,noheader,nounits");
+            psi.CreateNoWindow = true;
+            psi.UseShellExecute = false;
+            psi.RedirectStandardOutput = true;
+            using (Process p = Process.Start(psi))
+            {
+                string line = p.StandardOutput.ReadLine();
+                if (!string.IsNullOrEmpty(line))
+                {
+                    string[] parts = line.Split(',');
+                    if (parts.Length >= 2)
+                    {
+                        float l, t;
+                        if (float.TryParse(parts[0].Trim(), out l)) load = l;
+                        if (float.TryParse(parts[1].Trim(), out t)) temp = t;
+                    }
+                }
+            }
+        }
+        catch {}
+    }
+
+    public void Shutdown()
+    {
+        if (initialized)
+        {
+            try { nvmlShutdown(); } catch {}
+            initialized = false;
+        }
+    }
+}
